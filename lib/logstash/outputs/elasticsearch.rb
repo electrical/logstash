@@ -1,5 +1,6 @@
 require "logstash/namespace"
 require "logstash/outputs/base"
+require "stud/buffer"
 
 # This output lets you store logs in elasticsearch and is the most recommended
 # output for logstash. If you plan on using the logstash web interface, you'll
@@ -21,6 +22,8 @@ require "logstash/outputs/base"
 #
 # You can learn more about elasticsearch at <http://elasticsearch.org>
 class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
+
+  include Stud::Buffer
 
   config_name "elasticsearch"
   plugin_status "stable"
@@ -78,6 +81,10 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
   # By default, this is generated internally by the ES client.
   config :node_name, :validate => :string
 
+  config :bulk_size, :validate => :number, :default => 0
+
+  config :bulk_timeout, :validate => :number, :default => 10
+
   public
   def register
     # TODO(sissel): find a better way of declaring where the elasticsearch
@@ -86,6 +93,14 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
     jarpath = File.join(File.dirname(__FILE__), "../../../vendor/**/*.jar")
     Dir[jarpath].each do |jar|
         require jar
+    end
+
+    if @bulk_size > 0
+      buffer_initialize(
+        :max_items => @bulk_size,
+        :max_interval => @bulk_timeout,
+        :logger => @logger
+      )
     end
 
     # setup log4j properties for elasticsearch
@@ -141,6 +156,72 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
   public
   def receive(event)
     return unless output?(event)
+
+    if @bulk_size == 0
+      receive_single(event)
+    else
+      receive_bulk(event)
+    end
+      
+  end
+
+  public
+  def teardown
+    if @bulk_size > 0
+      buffer_flush(:final => true)
+    end
+  end
+
+  private
+  def receive_bulk(event)
+    return unless output?(event)
+
+    buffer_receive(event.to_json)
+
+  end
+
+  public
+  def flush(events)
+
+    index = event.sprintf(@index)
+    type = event.sprintf(@index_type)
+    bulk = @client.bulk
+
+    events.each do |data|
+
+      if @document_id.nil?
+        bulk.index(index, type, data.to_hash)
+      else
+        id = event.sprintf(@document_id)
+        bulk.index(index, type, id, data.to_hash)
+      end
+
+    end
+
+    done = false
+    bulk.on(:success) do |response|
+      assert_not_nil response
+      done = true
+    end.on(:failure) do |exception|
+      raise exception
+      done = true
+    end
+
+    bulk.execute
+
+  end
+
+  def on_flush_error(e)
+    @logger.warn("Failed to send backlog of events to Elasticsearch",
+      :index => event.sprintf(@index),
+      :exception => e,
+      :backtrace => e.backtrace
+    )
+  end
+
+
+  private
+  def receive_single(event)
 
     index = event.sprintf(@index)
     type = event.sprintf(@index_type)
